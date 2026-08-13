@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	models "github.com/nickheyer/discopanel/internal/db"
+	"github.com/nickheyer/discopanel/pkg/strmatch"
 )
 
 // ModLoaderInfo contains information about a specific mod loader
@@ -100,12 +101,14 @@ func GetModLoaderInfo(loader models.ModLoader) ModLoaderInfo {
 			ConfigDirectory: "plugins",
 			FileExtensions:  []string{".jar"},
 		}
+
+	// Paper-based
 	case models.ModLoaderPaper:
 		return ModLoaderInfo{
 			Name:            string(loader),
 			DisplayName:     "Paper",
 			Description:     "Performance-optimized fork of Spigot",
-			Category:        "Bukkit",
+			Category:        "Paper",
 			ModsDirectory:   "plugins",
 			ConfigDirectory: "plugins",
 			FileExtensions:  []string{".jar"},
@@ -115,7 +118,7 @@ func GetModLoaderInfo(loader models.ModLoader) ModLoaderInfo {
 			Name:            string(loader),
 			DisplayName:     "Purpur",
 			Description:     "Fork of Paper with additional gameplay features",
-			Category:        "Bukkit",
+			Category:        "Paper",
 			ModsDirectory:   "plugins",
 			ConfigDirectory: "plugins",
 			FileExtensions:  []string{".jar"},
@@ -125,7 +128,17 @@ func GetModLoaderInfo(loader models.ModLoader) ModLoaderInfo {
 			Name:            string(loader),
 			DisplayName:     "Pufferfish",
 			Description:     "Performance-focused fork of Paper",
-			Category:        "Bukkit",
+			Category:        "Paper",
+			ModsDirectory:   "plugins",
+			ConfigDirectory: "plugins",
+			FileExtensions:  []string{".jar"},
+		}
+	case models.ModLoaderFolia:
+		return ModLoaderInfo{
+			Name:            string(loader),
+			DisplayName:     "Pufferfish",
+			Description:     "Performance-focused fork of Paper",
+			Category:        "Paper",
 			ModsDirectory:   "plugins",
 			ConfigDirectory: "plugins",
 			FileExtensions:  []string{".jar"},
@@ -369,9 +382,12 @@ func GetAllModLoaders() []ModLoaderInfo {
 		// Bukkit-based
 		models.ModLoaderBukkit,
 		models.ModLoaderSpigot,
+
+		// Paper-based
 		models.ModLoaderPaper,
 		models.ModLoaderPurpur,
 		models.ModLoaderPufferfish,
+		models.ModLoaderFolia,
 
 		// Hybrids (Forge + Bukkit)
 		models.ModLoaderMagma,
@@ -406,4 +422,43 @@ func GetAllModLoaders() []ModLoaderInfo {
 	}
 
 	return infos
+}
+
+// Fuzzy weights for mod loader matches
+const (
+	modLoaderMatchThreshold     = 0.5
+	modpackLoaderMatchThreshold = 0.6
+)
+
+// Might need expansion as indexers expose more mod loaders but I think this is it
+var modpackLoaderNames = []string{
+	string(models.ModLoaderForge),
+	string(models.ModLoaderNeoForge),
+	string(models.ModLoaderFabric),
+	string(models.ModLoaderQuilt),
+}
+
+func MatchModLoader(input string) (models.ModLoader, bool) {
+	info, score, ok := strmatch.BestFunc(input, GetAllModLoaders(), func(i ModLoaderInfo) string {
+		return i.Name
+	})
+	if !ok || score < modLoaderMatchThreshold {
+		return "", false
+	}
+	return models.ModLoader(info.Name), true
+}
+
+// Inspects candidate strings for modloader identification
+func DetectModpackLoader(candidates ...string) (models.ModLoader, bool) {
+	best := ""
+	bestScore := 0.0
+	for _, c := range candidates {
+		if m, ok := strmatch.Best(c, modpackLoaderNames); ok && m.Score > bestScore {
+			best, bestScore = m.Value, m.Score
+		}
+	}
+	if best == "" || bestScore < modpackLoaderMatchThreshold {
+		return "", false
+	}
+	return models.ModLoader(best), true
 }

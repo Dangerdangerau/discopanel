@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nickheyer/discopanel/internal/command"
 	"github.com/nickheyer/discopanel/internal/config"
 	storage "github.com/nickheyer/discopanel/internal/db"
 	"github.com/nickheyer/discopanel/internal/docker"
@@ -18,6 +19,7 @@ import (
 type Manager struct {
 	store        *storage.Store
 	docker       *docker.Client
+	sender       *command.Sender
 	config       *config.Config
 	proxyManager *proxy.Manager
 	logger       *logger.Logger
@@ -27,10 +29,11 @@ type Manager struct {
 }
 
 // NewManager creates a new module manager
-func NewManager(store *storage.Store, docker *docker.Client, cfg *config.Config, proxyManager *proxy.Manager, log *logger.Logger) *Manager {
+func NewManager(store *storage.Store, docker *docker.Client, sender *command.Sender, cfg *config.Config, proxyManager *proxy.Manager, log *logger.Logger) *Manager {
 	return &Manager{
 		store:        store,
 		docker:       docker,
+		sender:       sender,
 		config:       cfg,
 		proxyManager: proxyManager,
 		logger:       log,
@@ -556,50 +559,6 @@ func (m *Manager) DeleteModule(ctx context.Context, moduleID string) error {
 	}
 
 	m.logger.Info("Deleted module: %s", module.Name)
-	return nil
-}
-
-// OnServerStart handles module auto-start when parent server starts
-func (m *Manager) OnServerStart(ctx context.Context, serverID string) error {
-	modules, err := m.store.ListServerModules(ctx, serverID)
-	if err != nil {
-		return fmt.Errorf("failed to list server modules: %w", err)
-	}
-
-	for _, module := range modules {
-		if module.AutoStart && !module.Detached {
-			go func(mod *storage.Module) {
-				// Small delay
-				time.Sleep(2 * time.Second)
-				if err := m.StartModule(context.Background(), mod.ID); err != nil {
-					m.logger.Error("Failed to start module %s on server start: %v", mod.Name, err)
-				} else {
-					m.logger.Info("Started module %s with server", mod.Name)
-				}
-			}(module)
-		}
-	}
-
-	return nil
-}
-
-// OnServerStop handles module stop when parent server stops
-func (m *Manager) OnServerStop(ctx context.Context, serverID string) error {
-	modules, err := m.store.ListModulesFollowingServerLifecycle(ctx, serverID)
-	if err != nil {
-		return fmt.Errorf("failed to list server modules: %w", err)
-	}
-
-	for _, module := range modules {
-		if module.Status == storage.ModuleStatusRunning && !module.Detached {
-			if err := m.StopModule(ctx, module.ID); err != nil {
-				m.logger.Error("Failed to stop module %s on server stop: %v", module.Name, err)
-			} else {
-				m.logger.Info("Stopped module %s with server", module.Name)
-			}
-		}
-	}
-
 	return nil
 }
 

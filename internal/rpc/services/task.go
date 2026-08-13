@@ -2,12 +2,14 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
 	storage "github.com/nickheyer/discopanel/internal/db"
 	"github.com/nickheyer/discopanel/internal/scheduler"
+	"github.com/nickheyer/discopanel/internal/webhook"
 	"github.com/nickheyer/discopanel/pkg/logger"
 	v1 "github.com/nickheyer/discopanel/pkg/proto/discopanel/v1"
 	"github.com/nickheyer/discopanel/pkg/proto/discopanel/v1/discopanelv1connect"
@@ -48,6 +50,8 @@ func dbTaskTypeToProto(t storage.TaskType) v1.TaskType {
 		return v1.TaskType_TASK_TYPE_STOP
 	case storage.TaskTypeScript:
 		return v1.TaskType_TASK_TYPE_SCRIPT
+	case storage.TaskTypeWebhook:
+		return v1.TaskType_TASK_TYPE_WEBHOOK
 	default:
 		return v1.TaskType_TASK_TYPE_UNSPECIFIED
 	}
@@ -68,6 +72,8 @@ func protoTaskTypeToDB(t v1.TaskType) storage.TaskType {
 		return storage.TaskTypeStop
 	case v1.TaskType_TASK_TYPE_SCRIPT:
 		return storage.TaskTypeScript
+	case v1.TaskType_TASK_TYPE_WEBHOOK:
+		return storage.TaskTypeWebhook
 	default:
 		return storage.TaskTypeCommand
 	}
@@ -110,6 +116,8 @@ func dbScheduleTypeToProto(s storage.ScheduleType) v1.ScheduleType {
 		return v1.ScheduleType_SCHEDULE_TYPE_INTERVAL
 	case storage.ScheduleTypeOnce:
 		return v1.ScheduleType_SCHEDULE_TYPE_ONCE
+	case storage.ScheduleTypeEvent:
+		return v1.ScheduleType_SCHEDULE_TYPE_EVENT
 	default:
 		return v1.ScheduleType_SCHEDULE_TYPE_UNSPECIFIED
 	}
@@ -124,6 +132,8 @@ func protoScheduleTypeToDB(s v1.ScheduleType) storage.ScheduleType {
 		return storage.ScheduleTypeInterval
 	case v1.ScheduleType_SCHEDULE_TYPE_ONCE:
 		return storage.ScheduleTypeOnce
+	case v1.ScheduleType_SCHEDULE_TYPE_EVENT:
+		return storage.ScheduleTypeEvent
 	default:
 		return storage.ScheduleTypeCron
 	}
@@ -174,6 +184,7 @@ func dbTaskToProto(task *storage.ScheduledTask) *v1.ScheduledTask {
 		RetryDelay:    int32(task.RetryDelay),
 		RequireOnline: task.RequireOnline,
 		FailureNotify: task.FailureNotify,
+		EventTriggers: task.EventTriggers,
 		CreatedAt:     timestamppb.New(task.CreatedAt),
 		UpdatedAt:     timestamppb.New(task.UpdatedAt),
 	}
@@ -270,13 +281,27 @@ func (s *TaskService) CreateTask(ctx context.Context, req *connect.Request[v1.Cr
 		}
 	}
 
+	// Validate event-triggered tasks
+	taskType := protoTaskTypeToDB(msg.TaskType)
+	eventTriggers := msg.EventTriggers
+	if scheduleType == storage.ScheduleTypeEvent && len(eventTriggers) == 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("at least one event_trigger is required for event-scheduled tasks"))
+	}
+
+	// Validate webhook task config
+	if taskType == storage.TaskTypeWebhook {
+		if err := validateWebhookConfig(msg.Config); err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		}
+	}
+
 	// Create task
 	task := &storage.ScheduledTask{
 		ID:            uuid.New().String(),
 		ServerID:      msg.ServerId,
 		Name:          msg.Name,
 		Description:   msg.Description,
-		TaskType:      protoTaskTypeToDB(msg.TaskType),
+		TaskType:      taskType,
 		Status:        storage.TaskStatusEnabled,
 		Schedule:      scheduleType,
 		CronExpr:      msg.CronExpr,
@@ -287,6 +312,7 @@ func (s *TaskService) CreateTask(ctx context.Context, req *connect.Request[v1.Cr
 		RetryCount:    int(msg.RetryCount),
 		RetryDelay:    int(msg.RetryDelay),
 		RequireOnline: msg.RequireOnline,
+		EventTriggers: eventTriggers,
 	}
 
 	// Set defaults
@@ -378,6 +404,24 @@ func (s *TaskService) UpdateTask(ctx context.Context, req *connect.Request[v1.Up
 	}
 	if msg.RequireOnline != nil {
 		task.RequireOnline = *msg.RequireOnline
+	}
+	if msg.ClearEventTriggers {
+		task.EventTriggers = nil
+	}
+	if len(msg.EventTriggers) > 0 {
+		task.EventTriggers = msg.EventTriggers
+	}
+
+	// Validate event-triggered tasks
+	if task.Schedule == storage.ScheduleTypeEvent && len(task.EventTriggers) == 0 {
+		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("at least one event_trigger is required for event-scheduled tasks"))
+	}
+
+	// Validate webhook task config
+	if task.TaskType == storage.TaskTypeWebhook {
+		if err := validateWebhookConfig(task.Config); err != nil {
+			return nil, connect.NewError(connect.CodeInvalidArgument, err)
+		}
 	}
 
 	// Recalculate next run
@@ -527,6 +571,26 @@ func (s *TaskService) CancelExecution(ctx context.Context, req *connect.Request[
 	return connect.NewResponse(&v1.CancelExecutionResponse{
 		Execution: dbExecutionToProto(execution),
 	}), nil
+}
+
+// validateWebhookConfig parses a webhook task config JSON and validates required fields.
+func validateWebhookConfig(cfg string) error {
+	if cfg == "" {
+		return fmt.Errorf("webhook config is required")
+	}
+	var wcfg webhook.Config
+	if err := json.Unmarshal([]byte(cfg), &wcfg); err != nil {
+		return fmt.Errorf("invalid webhook config JSON: %v", err)
+	}
+	if wcfg.URL == "" {
+		return fmt.Errorf("webhook URL is required")
+	}
+	if wcfg.PayloadTemplate != "" {
+		if err := webhook.ValidateTemplate(wcfg.PayloadTemplate); err != nil {
+			return fmt.Errorf("invalid payload template: %v", err)
+		}
+	}
+	return nil
 }
 
 // GetSchedulerStatus gets the scheduler status

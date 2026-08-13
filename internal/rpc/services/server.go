@@ -16,9 +16,11 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/google/uuid"
+	"github.com/nickheyer/discopanel/internal/command"
 	"github.com/nickheyer/discopanel/internal/config"
 	storage "github.com/nickheyer/discopanel/internal/db"
 	"github.com/nickheyer/discopanel/internal/docker"
+	"github.com/nickheyer/discopanel/internal/events"
 	"github.com/nickheyer/discopanel/internal/metrics"
 	"github.com/nickheyer/discopanel/internal/minecraft"
 	"github.com/nickheyer/discopanel/internal/module"
@@ -37,25 +39,29 @@ var _ discopanelv1connect.ServerServiceHandler = (*ServerService)(nil)
 type ServerService struct {
 	store            *storage.Store
 	docker           *docker.Client
+	sender           *command.Sender
 	config           *config.Config
 	proxy            *proxy.Manager
 	log              *logger.Logger
 	logStreamer      *logger.LogStreamer
 	metricsCollector *metrics.Collector
 	moduleManager    *module.Manager
+	bus              *events.Bus
 }
 
 // NewServerService creates a new server service
-func NewServerService(store *storage.Store, docker *docker.Client, config *config.Config, proxy *proxy.Manager, logStreamer *logger.LogStreamer, metricsCollector *metrics.Collector, moduleManager *module.Manager, log *logger.Logger) *ServerService {
+func NewServerService(store *storage.Store, docker *docker.Client, sender *command.Sender, config *config.Config, proxy *proxy.Manager, logStreamer *logger.LogStreamer, metricsCollector *metrics.Collector, moduleManager *module.Manager, bus *events.Bus, log *logger.Logger) *ServerService {
 	return &ServerService{
 		store:            store,
 		docker:           docker,
+		sender:           sender,
 		config:           config,
 		proxy:            proxy,
 		log:              log,
 		logStreamer:      logStreamer,
 		metricsCollector: metricsCollector,
 		moduleManager:    moduleManager,
+		bus:              bus,
 	}
 }
 
@@ -138,6 +144,8 @@ func dbModLoaderToProto(loader storage.ModLoader) v1.ModLoader {
 		return v1.ModLoader_MOD_LOADER_QUILT
 	case storage.ModLoaderPaper:
 		return v1.ModLoader_MOD_LOADER_PAPER
+	case storage.ModLoaderFolia:
+		return v1.ModLoader_MOD_LOADER_FOLIA
 	case storage.ModLoaderSpigot:
 		return v1.ModLoader_MOD_LOADER_SPIGOT
 	case storage.ModLoaderBukkit:
@@ -176,6 +184,8 @@ func protoModLoaderToDB(loader v1.ModLoader) storage.ModLoader {
 		return storage.ModLoaderQuilt
 	case v1.ModLoader_MOD_LOADER_PAPER:
 		return storage.ModLoaderPaper
+	case v1.ModLoader_MOD_LOADER_FOLIA:
+		return storage.ModLoaderFolia
 	case v1.ModLoader_MOD_LOADER_SPIGOT:
 		return storage.ModLoaderSpigot
 	case v1.ModLoader_MOD_LOADER_BUKKIT:
@@ -861,6 +871,13 @@ func (s *ServerService) UpdateServer(ctx context.Context, req *connect.Request[v
 
 	// Handle docker overrides update
 	if msg.DockerOverrides != nil {
+		// Check that labels do not start with "discopanel."
+		for key := range msg.DockerOverrides.Labels {
+			if strings.HasPrefix(key, "discopanel.") {
+				return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("docker label keys cannot start with 'discopanel.', namespace reserved for internal management"))
+			}
+		}
+
 		server.DockerOverrides = msg.DockerOverrides
 		needsRecreation = true
 	}
@@ -1108,11 +1125,12 @@ func (s *ServerService) StartServer(ctx context.Context, req *connect.Request[v1
 		s.log.Error("Failed to clear ephemeral config fields: %v", err)
 	}
 
-	// Start modules that have AutoStart enabled
-	if s.moduleManager != nil {
-		if err := s.moduleManager.OnServerStart(ctx, server.ID); err != nil {
-			s.log.Error("Failed to start modules for server %s: %v", server.ID, err)
-		}
+	// Emit the server-start event
+	if s.bus != nil {
+		s.bus.Emit(ctx, events.Event{
+			Type:     v1.TriggeredEventType_TRIGGERED_EVENT_TYPE_SERVER_START,
+			ServerID: server.ID,
+		})
 	}
 
 	return connect.NewResponse(&v1.StartServerResponse{
@@ -1165,11 +1183,12 @@ func (s *ServerService) StopServer(ctx context.Context, req *connect.Request[v1.
 		}
 	}
 
-	// Stop modules that follow server lifecycle
-	if s.moduleManager != nil {
-		if err := s.moduleManager.OnServerStop(ctx, server.ID); err != nil {
-			s.log.Error("Failed to stop modules for server %s: %v", server.ID, err)
-		}
+	// Emit the server-stop event
+	if s.bus != nil {
+		s.bus.Emit(ctx, events.Event{
+			Type:     v1.TriggeredEventType_TRIGGERED_EVENT_TYPE_SERVER_STOP,
+			ServerID: server.ID,
+		})
 	}
 
 	status := "stopping"
@@ -1230,6 +1249,14 @@ func (s *ServerService) RestartServer(ctx context.Context, req *connect.Request[
 			s.log.Error("Failed to clear ephemeral config fields: %v", err)
 		}
 
+		// Emit the server-restart event
+		if s.bus != nil {
+			s.bus.Emit(ctx, events.Event{
+				Type:     v1.TriggeredEventType_TRIGGERED_EVENT_TYPE_SERVER_RESTART,
+				ServerID: server.ID,
+			})
+		}
+
 		return connect.NewResponse(&v1.RestartServerResponse{
 			Status: "starting",
 		}), nil
@@ -1252,6 +1279,14 @@ func (s *ServerService) RestartServer(ctx context.Context, req *connect.Request[
 	// Clear ephemeral configuration fields
 	if err := s.store.ClearEphemeralConfigFields(ctx, server.ID); err != nil {
 		s.log.Error("Failed to clear ephemeral config fields: %v", err)
+	}
+
+	// Emit the server-restart event
+	if s.bus != nil {
+		s.bus.Emit(ctx, events.Event{
+			Type:     v1.TriggeredEventType_TRIGGERED_EVENT_TYPE_SERVER_RESTART,
+			ServerID: server.ID,
+		})
 	}
 
 	return connect.NewResponse(&v1.RestartServerResponse{
@@ -1318,6 +1353,12 @@ func (s *ServerService) RecreateServer(ctx context.Context, req *connect.Request
 // SendCommand sends a command to a server
 func (s *ServerService) SendCommand(ctx context.Context, req *connect.Request[v1.SendCommandRequest]) (*connect.Response[v1.SendCommandResponse], error) {
 	server, err := s.store.GetServer(ctx, req.Msg.Id)
+
+	silent := false
+	if req.Msg.Silent != nil {
+		silent = *req.Msg.Silent
+	}
+
 	if err != nil {
 		s.log.Error("Failed to get server: %v", err)
 		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("server not found"))
@@ -1339,16 +1380,16 @@ func (s *ServerService) SendCommand(ctx context.Context, req *connect.Request[v1
 
 	// Add command to log stream if available
 	commandTime := time.Now()
-	if s.logStreamer != nil {
+	if !silent && s.logStreamer != nil {
 		s.logStreamer.AddCommandEntry(server.ContainerID, req.Msg.Command, commandTime)
 	}
 
-	// Execute command in container
-	output, err := s.docker.ExecCommand(ctx, server.ContainerID, req.Msg.Command)
+	// Send command
+	output, err := s.sender.SendCommand(ctx, server.ID, req.Msg.Command)
 	success := err == nil
 
 	// Add command output to log stream if available
-	if s.logStreamer != nil && (output != "" || !success) {
+	if !silent && s.logStreamer != nil && (output != "" || !success) {
 		s.logStreamer.AddCommandOutput(server.ContainerID, output, success, commandTime)
 	}
 

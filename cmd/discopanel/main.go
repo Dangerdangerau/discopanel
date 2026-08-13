@@ -11,15 +11,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nickheyer/discopanel/internal/command"
 	"github.com/nickheyer/discopanel/internal/config"
 	storage "github.com/nickheyer/discopanel/internal/db"
 	"github.com/nickheyer/discopanel/internal/docker"
+	"github.com/nickheyer/discopanel/internal/events"
 	"github.com/nickheyer/discopanel/internal/metrics"
 	"github.com/nickheyer/discopanel/internal/module"
 	"github.com/nickheyer/discopanel/internal/proxy"
 	"github.com/nickheyer/discopanel/internal/rpc"
 	"github.com/nickheyer/discopanel/internal/scheduler"
 	"github.com/nickheyer/discopanel/pkg/logger"
+	v1 "github.com/nickheyer/discopanel/pkg/proto/discopanel/v1"
 )
 
 func main() {
@@ -71,6 +74,8 @@ func main() {
 		APIVersion:  cfg.Docker.Version,
 		NetworkName: cfg.Docker.NetworkName,
 		RegistryURL: cfg.Docker.RegistryURL,
+		DNS:         cfg.Docker.DNS,
+		Labels:      cfg.Docker.Labels,
 	})
 	if err != nil {
 		log.Fatal("Failed to initialize Docker client: %v", err)
@@ -156,8 +161,17 @@ func main() {
 	}
 	defer proxyManager.Stop()
 
+	// Initialize command sender
+	sender := command.NewSender(store, cfg, dockerClient)
+
+	// Initialize the central event bus
+	eventBus := events.NewBus(log)
+
+	// Initialize metrics collector
+	metricsCollector := metrics.NewCollector(store, dockerClient, sender, cfg, eventBus, log)
+
 	// Initialize task scheduler
-	taskScheduler := scheduler.NewScheduler(store, dockerClient, log, scheduler.Config{
+	taskScheduler := scheduler.NewScheduler(store, dockerClient, sender, cfg, metricsCollector, log, scheduler.Config{
 		CheckInterval: time.Duration(cfg.Docker.SyncInterval) * time.Second, // Use same interval as container status monitor
 	})
 
@@ -167,27 +181,30 @@ func main() {
 	}
 	defer taskScheduler.Stop()
 
-	// Initialize metrics collector
-	metricsCollector := metrics.NewCollector(store, dockerClient, cfg, log)
-	if err := metricsCollector.Start(); err != nil {
-		log.Error("Failed to start metrics collector: %v", err)
-	}
-	defer metricsCollector.Stop()
-
 	// Initialize builtin module templates
 	if err := module.InitBuiltinTemplates(store); err != nil {
 		log.Error("Failed to initialize builtin module templates: %v", err)
 	}
 
 	// Initialize module manager
-	moduleManager := module.NewManager(store, dockerClient, cfg, proxyManager, log)
+	moduleManager := module.NewManager(store, dockerClient, sender, cfg, proxyManager, log)
 	if err := moduleManager.Start(); err != nil {
 		log.Error("Failed to start module manager: %v", err)
 	}
 	defer moduleManager.Stop()
 
+	// Register event consumers on the event bus - EVENT CONSUMERS REGISTER HERE...
+	eventBus.Subscribe(moduleManager.HandleServerEvent)
+	eventBus.Subscribe(taskScheduler.HandleServerEvent)
+
+	// Start the metrics collector now that consumers are subscribed
+	if err := metricsCollector.Start(); err != nil {
+		log.Error("Failed to start metrics collector: %v", err)
+	}
+	defer metricsCollector.Stop()
+
 	// Initialize RPC server with full configuration
-	rpcServer := rpc.NewServer(store, dockerClient, cfg, proxyManager, taskScheduler, metricsCollector, moduleManager, log)
+	rpcServer := rpc.NewServer(store, dockerClient, sender, cfg, proxyManager, taskScheduler, metricsCollector, moduleManager, eventBus, log)
 
 	// Print recovery key
 	if key := rpcServer.RecoveryKey(); key != "" {
@@ -261,10 +278,11 @@ func main() {
 
 				log.Info("Successfully auto-started server: %s", server.Name)
 
-				// Start modules with auto-start enabled
-				if err := moduleManager.OnServerStart(ctx, server.ID); err != nil {
-					log.Error("Failed to auto-start modules for server %s: %v", server.Name, err)
-				}
+				// Emit the server-start event
+				eventBus.Emit(ctx, events.Event{
+					Type:     v1.TriggeredEventType_TRIGGERED_EVENT_TYPE_SERVER_START,
+					ServerID: server.ID,
+				})
 			}()
 		}
 	}
